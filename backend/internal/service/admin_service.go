@@ -2479,6 +2479,28 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		// 敏感子键采用"incoming 没提供就保留"的合并语义：前端响应已脱敏，
 		// 全对象 PUT 编辑时不会再带回 token，避免覆盖时清空已有凭证。
 		account.Credentials = MergePreservingSensitiveCreds(account.Credentials, input.Credentials)
+
+		// 同步顶层 expires_at 列以及自动取消暂停。
+		//
+		// 顶层 accounts.expires_at 列 与 credentials JSON 里的 expires_at 字段
+		// 会因为 PUT /accounts/:id（OAuth re-auth 完成后前端只回写 credentials）
+		// 或 token_refresher 后台刷新而漂移。account_expiry_service 后台 sweeper
+		// 只读列、不看 JSON，于是会把 credentials 已经刷新过的账号错误地 auto-pause。
+		//
+		// 此处在 credentials 合并之后立刻从 credentials 解析新的过期时间并同步到列；
+		// 当解析到的新过期时间在未来、且账号当前因 auto-pause 处于 schedulable=false，
+		// 还顺手解除暂停 —— sweeper 是单向（只 pause 不 unpause），不在这里做就要靠
+		// 调用方记得手动 toggle，UX 上死循环（toggle 一次还会被下一次 sweeper 推回，
+		// 因为旧列值还在）。
+		//
+		// 如果调用方在同一个请求里**显式**传了 input.ExpiresAt，下面 2545+ 的分支会
+		// 覆盖这里的同步结果 —— 显式优先于自动同步，是正确的语义。
+		if t := ParseCredentialExpiresAt(account.Credentials); t != nil {
+			account.ExpiresAt = t
+			if !account.Schedulable && account.AutoPauseOnExpired && t.After(time.Now()) {
+				account.Schedulable = true
+			}
+		}
 	}
 	// Extra 使用 map：需要区分“未提供(nil)”与“显式清空({})”。
 	// 关闭配额限制时前端会删除 quota_* 键并提交 extra:{}，此时也必须落库。
